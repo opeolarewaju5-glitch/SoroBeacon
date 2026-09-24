@@ -10,16 +10,21 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// The tests below are part of the shared conformance suite, so they run against
+// both backends: a health counter that is right on Postgres and silently wrong
+// on SQLite would be worse than no counter at all. The helpers take the store
+// interface rather than a concrete type for the same reason.
+
 // healthChannel creates an enabled channel for the health tests.
-func healthChannel(t *testing.T, st *Postgres) *Channel {
+func healthChannel(t *testing.T, st conformanceStore) *Channel {
 	t.Helper()
 	ch := &Channel{Name: "ops", Type: "webhook", Config: json.RawMessage(`{"url":"https://example.invalid"}`), Enabled: true}
 	require.NoError(t, st.CreateChannel(context.Background(), ch))
 	return ch
 }
 
-// fail records one failure and returns the channel as stored afterwards.
-func fail(t *testing.T, st *Postgres, id int64, permanent bool, disableAfter int, msg string) Channel {
+// fail records one delivery failure and returns the channel as stored after it.
+func fail(t *testing.T, st conformanceStore, id int64, permanent bool, disableAfter int, msg string) Channel {
 	t.Helper()
 	ctx := context.Background()
 	require.NoError(t, st.RecordChannelHealth(ctx, id, ChannelHealthUpdate{
@@ -31,7 +36,7 @@ func fail(t *testing.T, st *Postgres, id int64, permanent bool, disableAfter int
 }
 
 // succeed records one successful delivery and returns the stored channel.
-func succeed(t *testing.T, st *Postgres, id int64) Channel {
+func succeed(t *testing.T, st conformanceStore, id int64) Channel {
 	t.Helper()
 	ctx := context.Background()
 	require.NoError(t, st.RecordChannelHealth(ctx, id, ChannelHealthUpdate{Success: true, At: time.Now()}))
@@ -40,8 +45,8 @@ func succeed(t *testing.T, st *Postgres, id int64) Channel {
 	return *got
 }
 
-func TestRecordChannelHealthCountsByKind(t *testing.T) {
-	st := testStore(t)
+func testChannelHealthCountsByKind(t *testing.T, newStore conformanceFactory) {
+	st := newStore(t)
 	ch := healthChannel(t, st)
 
 	// A transient failure counts and is reported, but it is not the kind of
@@ -60,8 +65,8 @@ func TestRecordChannelHealthCountsByKind(t *testing.T) {
 	assert.Equal(t, "failing", got.HealthStatus())
 }
 
-func TestRecordChannelHealthSuccessResets(t *testing.T) {
-	st := testStore(t)
+func testChannelHealthSuccessResets(t *testing.T, newStore conformanceFactory) {
+	st := newStore(t)
 	ch := healthChannel(t, st)
 
 	fail(t, st, ch.ID, true, 0, "status 401: Unauthorized")
@@ -76,8 +81,8 @@ func TestRecordChannelHealthSuccessResets(t *testing.T) {
 	assert.Equal(t, "ok", got.HealthStatus())
 }
 
-func TestRecordChannelHealthAutoDisablesOnPermanentFailures(t *testing.T) {
-	st := testStore(t)
+func testChannelHealthAutoDisablesOnPermanentFailures(t *testing.T, newStore conformanceFactory) {
+	st := newStore(t)
 	ch := healthChannel(t, st)
 
 	got := fail(t, st, ch.ID, true, 3, "status 401: Unauthorized")
@@ -100,8 +105,8 @@ func TestRecordChannelHealthAutoDisablesOnPermanentFailures(t *testing.T) {
 	assert.Empty(t, enabled)
 }
 
-func TestRecordChannelHealthWithoutThresholdNeverDisables(t *testing.T) {
-	st := testStore(t)
+func testChannelHealthWithoutThresholdNeverDisables(t *testing.T, newStore conformanceFactory) {
+	st := newStore(t)
 	ch := healthChannel(t, st)
 
 	for i := 0; i < 10; i++ {
@@ -115,8 +120,8 @@ func TestRecordChannelHealthWithoutThresholdNeverDisables(t *testing.T) {
 	assert.Equal(t, int64(10), got.ConsecutivePermanentFailures)
 }
 
-func TestRecordChannelHealthTransientFailuresNeverDisable(t *testing.T) {
-	st := testStore(t)
+func testChannelHealthTransientFailuresNeverDisable(t *testing.T, newStore conformanceFactory) {
+	st := newStore(t)
 	ch := healthChannel(t, st)
 
 	for i := 0; i < 5; i++ {
@@ -133,8 +138,8 @@ func TestRecordChannelHealthTransientFailuresNeverDisable(t *testing.T) {
 
 // A 5xx in the middle of a revoked-token streak must not hide the streak:
 // otherwise provider noise could keep a dead channel in rotation forever.
-func TestRecordChannelHealthTransientDoesNotMaskPermanentStreak(t *testing.T) {
-	st := testStore(t)
+func testChannelHealthTransientDoesNotMaskPermanentStreak(t *testing.T, newStore conformanceFactory) {
+	st := newStore(t)
 	ch := healthChannel(t, st)
 
 	fail(t, st, ch.ID, true, 2, "status 401: Unauthorized")
@@ -146,8 +151,8 @@ func TestRecordChannelHealthTransientDoesNotMaskPermanentStreak(t *testing.T) {
 	assert.Equal(t, int64(2), got.ConsecutivePermanentFailures)
 }
 
-func TestUpdateChannelReenableClearsHealth(t *testing.T) {
-	st := testStore(t)
+func testUpdateChannelReenableClearsHealth(t *testing.T, newStore conformanceFactory) {
+	st := newStore(t)
 	ctx := context.Background()
 	ch := healthChannel(t, st)
 
@@ -176,8 +181,8 @@ func TestUpdateChannelReenableClearsHealth(t *testing.T) {
 
 // Renaming a channel that is still failing must not wipe the evidence, or the
 // dashboard would go quiet about a channel that is dropping alerts.
-func TestUpdateChannelRenameKeepsHealth(t *testing.T) {
-	st := testStore(t)
+func testUpdateChannelRenameKeepsHealth(t *testing.T, newStore conformanceFactory) {
+	st := newStore(t)
 	ctx := context.Background()
 	ch := healthChannel(t, st)
 
@@ -197,11 +202,13 @@ func TestUpdateChannelRenameKeepsHealth(t *testing.T) {
 }
 
 // A channel deleted while a delivery is in flight is a race, not a bug.
-func TestRecordChannelHealthUnknownChannelIsIgnored(t *testing.T) {
-	st := testStore(t)
+func testChannelHealthUnknownChannelIsIgnored(t *testing.T, newStore conformanceFactory) {
+	st := newStore(t)
 	assert.NoError(t, st.RecordChannelHealth(context.Background(), 4242, ChannelHealthUpdate{Permanent: true, Error: "boom"}))
 }
 
+// TestChannelHealthStatus pins HealthStatus, which is pure and therefore
+// backend-neutral; the store tests above prove the columns it reads are right.
 func TestChannelHealthStatus(t *testing.T) {
 	when := time.Date(2026, 9, 24, 0, 0, 0, 0, time.UTC)
 	tests := []struct {

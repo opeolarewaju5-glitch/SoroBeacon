@@ -53,7 +53,7 @@ type Channel struct {
 	CreatedAt time.Time       `json:"created_at"`
 
 	// The fields below are delivery health, derived from outcomes rather than
-	// configured (see RecordChannelHealth and migration 0007). They answer
+	// configured (see RecordChannelHealth and migration 0009). They answer
 	// "is this channel still working?", which delivery_attempts could only
 	// answer one alert at a time.
 	//
@@ -380,11 +380,11 @@ type Ingest interface {
 
 // SavedSearch is a named, reusable alert filter combination.
 type SavedSearch struct {
-	ID        int64            `json:"id"`
-	Name      string           `json:"name"`
+	ID        int64             `json:"id"`
+	Name      string            `json:"name"`
 	Filter    SavedSearchFilter `json:"filter"`
-	IsDefault bool             `json:"is_default"`
-	CreatedAt time.Time        `json:"created_at"`
+	IsDefault bool              `json:"is_default"`
+	CreatedAt time.Time         `json:"created_at"`
 }
 
 // SavedSearchFilter stores the structured filter fields so surviving
@@ -410,13 +410,13 @@ type SavedSearches interface {
 // a template are one-time copies: editing the template does not retroactively
 // change existing monitors, so operators can tweak instances without fear.
 type MonitorTemplate struct {
-	ID          int64                  `json:"id"`
-	Name        string                 `json:"name"`
-	Description string                 `json:"description"`
-	Rules       []MonitorTemplateRule  `json:"rules"`
-	ChannelIDs  []int64                `json:"channel_ids"`
-	Parameters  []TemplateParameter    `json:"parameters"`
-	CreatedAt   time.Time              `json:"created_at"`
+	ID          int64                 `json:"id"`
+	Name        string                `json:"name"`
+	Description string                `json:"description"`
+	Rules       []MonitorTemplateRule `json:"rules"`
+	ChannelIDs  []int64               `json:"channel_ids"`
+	Parameters  []TemplateParameter   `json:"parameters"`
+	CreatedAt   time.Time             `json:"created_at"`
 }
 
 // MonitorTemplateRule is one rule definition inside a template. Params may
@@ -432,6 +432,16 @@ type TemplateParameter struct {
 	Description string `json:"description,omitempty"`
 	Required    bool   `json:"required"`
 	Default     string `json:"default,omitempty"`
+}
+
+// templateChannelIDs normalises a template's channel list for storage. A nil
+// slice would be written as SQL NULL (Postgres) or JSON null (SQLite), and
+// channel_ids is NOT NULL: an empty list means "no channels", not "unknown".
+func templateChannelIDs(ids []int64) []int64 {
+	if ids == nil {
+		return []int64{}
+	}
+	return ids
 }
 
 // MonitorTemplates persists monitor templates.

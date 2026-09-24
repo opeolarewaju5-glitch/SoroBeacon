@@ -1020,7 +1020,7 @@ func (p *Postgres) CreateMonitorTemplate(ctx context.Context, t *MonitorTemplate
 	paramsJSON, _ := json.Marshal(t.Parameters)
 	return p.pool.QueryRow(ctx,
 		`INSERT INTO monitor_templates (name, description, rules, channel_ids, parameters) VALUES ($1, $2, $3, $4, $5) RETURNING id, created_at`,
-		t.Name, t.Description, rulesJSON, t.ChannelIDs, paramsJSON).Scan(&t.ID, &t.CreatedAt)
+		t.Name, t.Description, rulesJSON, templateChannelIDs(t.ChannelIDs), paramsJSON).Scan(&t.ID, &t.CreatedAt)
 }
 
 func (p *Postgres) GetMonitorTemplate(ctx context.Context, id int64) (*MonitorTemplate, error) {
@@ -1069,7 +1069,7 @@ func (p *Postgres) UpdateMonitorTemplate(ctx context.Context, t *MonitorTemplate
 	paramsJSON, _ := json.Marshal(t.Parameters)
 	tag, err := p.pool.Exec(ctx,
 		`UPDATE monitor_templates SET name=$1, description=$2, rules=$3, channel_ids=$4, parameters=$5 WHERE id=$6`,
-		t.Name, t.Description, rulesJSON, t.ChannelIDs, paramsJSON, t.ID)
+		t.Name, t.Description, rulesJSON, templateChannelIDs(t.ChannelIDs), paramsJSON, t.ID)
 	if err != nil {
 		return err
 	}
