@@ -85,6 +85,7 @@ vs optional, secrets, and `SOURCE_MODE`-only notes — is
 | `RATE_LIMIT_RPS` | `0` (off)                             | Per-client API requests per second           |
 | `RATE_LIMIT_BURST` | `ceil(RPS)` when enabled            | Per-client token-bucket size                 |
 | `RATE_LIMIT_TRUST_FORWARDED` | `false`                  | Key clients by `X-Forwarded-For` (proxy only) |
+| `CHANNEL_DISABLE_AFTER_FAILURES` | `0` (never)         | Consecutive permanent channel failures before auto-disable |
 
 ### Networks
 
@@ -126,6 +127,18 @@ Channel secrets (webhook URLs, bot tokens, SMTP credentials) live in each
 channel's `config` JSON in the database. They are never logged and never
 returned by the API. Set `CONFIG_ENCRYPTION_KEY` to encrypt them at rest;
 see the [configuration guide](docs/getting-started/configuration.md#encrypting-channel-config-at-rest).
+
+Every delivery folds its outcome into the channel, so a channel that has
+stopped working says so instead of going quiet — `GET /api/v1/channels`
+carries the consecutive failure count, the last error and the last success,
+and an auto-disabled channel is flagged on the dashboard with the error that
+parked it. Failures are split into permanent (`401`/`403`/`404`, a revoked
+token) and transient (`5xx`, timeouts), because only the permanent kind can
+tell you a channel will never recover on its own. Set
+`CHANNEL_DISABLE_AFTER_FAILURES` to park a channel automatically after that
+many permanent failures; it is **off by default**, and re-enabling is an
+explicit `PATCH {"enabled": true}`. See the
+[channel health reference](docs/configuration.md#channel-health).
 
 > ⚠️ With `API_TOKEN` unset the API and dashboard are **unauthenticated**.
 > Set it to require `Authorization: Bearer <token>` on `/api/v1` and a

@@ -107,6 +107,13 @@ type Config struct {
 	// MonitorSilentAfter is how long since last_matched_at before the
 	// dashboard marks a monitor silent. Default 24h.
 	MonitorSilentAfter time.Duration
+	// ChannelDisableAfterFailures is how many consecutive permanent channel
+	// failures (401/403/404 — a revoked bot token, a deleted webhook) take a
+	// channel out of rotation. Zero, the default when the variable is unset,
+	// never auto-disables: silently switching off someone's alerting is a
+	// worse outcome than the failure it would fix, so opting in is the
+	// operator's call.
+	ChannelDisableAfterFailures int
 }
 
 // Load reads configuration from the environment. DATABASE_URL is the only
@@ -225,6 +232,14 @@ func Load() (Config, error) {
 			cfg.RateLimitBurst = 1
 		}
 	}
+	if v := os.Getenv("CHANNEL_DISABLE_AFTER_FAILURES"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return cfg, fmt.Errorf("invalid CHANNEL_DISABLE_AFTER_FAILURES %q (want a non-negative integer)", v)
+		}
+		cfg.ChannelDisableAfterFailures = n
+	}
+
 	if v := os.Getenv("MONITOR_SILENT_AFTER"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
@@ -324,6 +339,7 @@ func (c Config) LogAttrs() []slog.Attr {
 		// The count, never the tokens themselves: LogAttrs is the one place
 		// configuration is printed, and an API token is a credential.
 		slog.Int("api_token_count", len(c.APITokens)),
+		slog.Int("channel_disable_after_failures", c.ChannelDisableAfterFailures),
 	}
 }
 
