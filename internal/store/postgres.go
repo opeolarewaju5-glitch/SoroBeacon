@@ -479,7 +479,7 @@ func (p *Postgres) DeleteRule(ctx context.Context, id int64) error {
 // --- channels ---
 
 func (p *Postgres) CreateChannel(ctx context.Context, c *Channel) error {
-	config, err := p.configForWrite(c.ID, c.Name, c.Config)
+	config, err := configForWrite(p.cipher, c.ID, c.Name, c.Config)
 	if err != nil {
 		return err
 	}
@@ -503,7 +503,7 @@ func (p *Postgres) GetChannel(ctx context.Context, id int64) (*Channel, error) {
 	if err != nil {
 		return nil, mapErr(err)
 	}
-	if err := p.decryptChannel(&c); err != nil {
+	if err := decryptChannel(p.cipher, &c); err != nil {
 		return nil, err
 	}
 	return &c, nil
@@ -553,7 +553,7 @@ func (p *Postgres) ListChannelsPage(ctx context.Context, f ListFilter) ([]Channe
 }
 
 func (p *Postgres) UpdateChannel(ctx context.Context, c *Channel) error {
-	config, err := p.configForWrite(c.ID, c.Name, c.Config)
+	config, err := configForWrite(p.cipher, c.ID, c.Name, c.Config)
 	if err != nil {
 		return err
 	}
@@ -653,7 +653,7 @@ func (p *Postgres) scanChannel(row pgx.CollectableRow) (Channel, error) {
 		&c.LastErrorAt, &c.LastSuccessAt, &c.DisabledAt); err != nil {
 		return c, err
 	}
-	if err := p.decryptChannel(&c); err != nil {
+	if err := decryptChannel(p.cipher, &c); err != nil {
 		return c, err
 	}
 	return c, nil
@@ -935,6 +935,153 @@ func (p *Postgres) AlertCountsByDay(ctx context.Context, days int) ([]AlertDayCo
 }
 
 // --- helpers ---
+
+// --- saved searches ---
+
+func (p *Postgres) CreateSavedSearch(ctx context.Context, s *SavedSearch) error {
+	filter, _ := json.Marshal(s.Filter)
+	if s.IsDefault {
+		_, _ = p.pool.Exec(ctx, `UPDATE saved_searches SET is_default = FALSE WHERE is_default = TRUE`)
+	}
+	return p.pool.QueryRow(ctx,
+		`INSERT INTO saved_searches (name, filter, is_default) VALUES ($1, $2, $3) RETURNING id, created_at`,
+		s.Name, filter, s.IsDefault).Scan(&s.ID, &s.CreatedAt)
+}
+
+func (p *Postgres) ListSavedSearches(ctx context.Context) ([]SavedSearch, error) {
+	rows, err := p.pool.Query(ctx,
+		`SELECT id, name, filter, is_default, created_at FROM saved_searches ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []SavedSearch
+	for rows.Next() {
+		var s SavedSearch
+		var filter []byte
+		if err := rows.Scan(&s.ID, &s.Name, &filter, &s.IsDefault, &s.CreatedAt); err != nil {
+			return nil, err
+		}
+		_ = json.Unmarshal(filter, &s.Filter)
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+func (p *Postgres) GetSavedSearch(ctx context.Context, id int64) (*SavedSearch, error) {
+	var s SavedSearch
+	var filter []byte
+	err := p.pool.QueryRow(ctx,
+		`SELECT id, name, filter, is_default, created_at FROM saved_searches WHERE id = $1`, id).
+		Scan(&s.ID, &s.Name, &filter, &s.IsDefault, &s.CreatedAt)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	_ = json.Unmarshal(filter, &s.Filter)
+	return &s, nil
+}
+
+func (p *Postgres) DeleteSavedSearch(ctx context.Context, id int64) error {
+	return p.deleteByID(ctx, "saved_searches", id)
+}
+
+func (p *Postgres) SetDefaultSearch(ctx context.Context, id int64) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+	_, _ = tx.Exec(ctx, `UPDATE saved_searches SET is_default = FALSE WHERE is_default = TRUE`)
+	tag, err := tx.Exec(ctx, `UPDATE saved_searches SET is_default = TRUE WHERE id = $1`, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return tx.Commit(ctx)
+}
+
+func (p *Postgres) ClearDefaultSearch(ctx context.Context, id int64) error {
+	tag, err := p.pool.Exec(ctx, `UPDATE saved_searches SET is_default = FALSE WHERE id = $1`, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// --- monitor templates ---
+
+func (p *Postgres) CreateMonitorTemplate(ctx context.Context, t *MonitorTemplate) error {
+	rulesJSON, _ := json.Marshal(t.Rules)
+	paramsJSON, _ := json.Marshal(t.Parameters)
+	return p.pool.QueryRow(ctx,
+		`INSERT INTO monitor_templates (name, description, rules, channel_ids, parameters) VALUES ($1, $2, $3, $4, $5) RETURNING id, created_at`,
+		t.Name, t.Description, rulesJSON, t.ChannelIDs, paramsJSON).Scan(&t.ID, &t.CreatedAt)
+}
+
+func (p *Postgres) GetMonitorTemplate(ctx context.Context, id int64) (*MonitorTemplate, error) {
+	var t MonitorTemplate
+	var rulesJSON, paramsJSON []byte
+	err := p.pool.QueryRow(ctx,
+		`SELECT id, name, description, rules, channel_ids, parameters, created_at FROM monitor_templates WHERE id = $1`, id).
+		Scan(&t.ID, &t.Name, &t.Description, &rulesJSON, &t.ChannelIDs, &paramsJSON, &t.CreatedAt)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	_ = json.Unmarshal(rulesJSON, &t.Rules)
+	_ = json.Unmarshal(paramsJSON, &t.Parameters)
+	if t.ChannelIDs == nil {
+		t.ChannelIDs = []int64{}
+	}
+	return &t, nil
+}
+
+func (p *Postgres) ListMonitorTemplates(ctx context.Context) ([]MonitorTemplate, error) {
+	rows, err := p.pool.Query(ctx,
+		`SELECT id, name, description, rules, channel_ids, parameters, created_at FROM monitor_templates ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []MonitorTemplate
+	for rows.Next() {
+		var t MonitorTemplate
+		var rulesJSON, paramsJSON []byte
+		if err := rows.Scan(&t.ID, &t.Name, &t.Description, &rulesJSON, &t.ChannelIDs, &paramsJSON, &t.CreatedAt); err != nil {
+			return nil, err
+		}
+		_ = json.Unmarshal(rulesJSON, &t.Rules)
+		_ = json.Unmarshal(paramsJSON, &t.Parameters)
+		if t.ChannelIDs == nil {
+			t.ChannelIDs = []int64{}
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+func (p *Postgres) UpdateMonitorTemplate(ctx context.Context, t *MonitorTemplate) error {
+	rulesJSON, _ := json.Marshal(t.Rules)
+	paramsJSON, _ := json.Marshal(t.Parameters)
+	tag, err := p.pool.Exec(ctx,
+		`UPDATE monitor_templates SET name=$1, description=$2, rules=$3, channel_ids=$4, parameters=$5 WHERE id=$6`,
+		t.Name, t.Description, rulesJSON, t.ChannelIDs, paramsJSON, t.ID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (p *Postgres) DeleteMonitorTemplate(ctx context.Context, id int64) error {
+	return p.deleteByID(ctx, "monitor_templates", id)
+}
 
 func (p *Postgres) deleteByID(ctx context.Context, table string, id int64) error {
 	tag, err := p.pool.Exec(ctx, `DELETE FROM `+table+` WHERE id = $1`, id)

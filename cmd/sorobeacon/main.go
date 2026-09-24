@@ -70,22 +70,24 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Storage.
+	// Storage. The DATABASE_URL scheme selects the backend: postgres /
+	// postgresql for the pgx pool, sqlite for a single-file database that
+	// removes the Postgres prerequisite on a small VPS or Raspberry Pi. Both
+	// implement store.Store and apply their own embedded migrations.
 	if err := store.Migrate(cfg.DatabaseURL); err != nil {
 		return err
 	}
-	st, err := store.NewPostgres(ctx, cfg.DatabaseURL, store.PoolSettings{
+	st, err := store.New(ctx, cfg.DatabaseURL, store.PoolSettings{
 		MaxConns:        cfg.DatabaseMaxConns,
 		MinConns:        cfg.DatabaseMinConns,
 		MaxConnLifetime: cfg.DatabaseMaxConnLifetime,
 		MaxConnIdleTime: cfg.DatabaseMaxConnIdleTime,
-	})
+	}, configCipher)
 	if err != nil {
 		return err
 	}
-	st.WithConfigCipher(configCipher)
 	defer st.Close()
-	log.Info("database ready")
+	log.Info("database ready", "backend", store.BackendName(cfg.DatabaseURL))
 
 	// Pipeline: event source -> rules -> alerts -> channels. The source is
 	// the single seam between the poller and wherever events come from.

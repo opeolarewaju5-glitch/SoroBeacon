@@ -54,6 +54,12 @@ make build
 set -a; . ./.env; set +a; ./bin/sorobeacon
 ```
 
+No Postgres on the box? Point `DATABASE_URL` at a file instead —
+`DATABASE_URL=sqlite:///var/lib/sorobeacon/sorobeacon.db` starts a working
+instance with no external service. SQLite backs a single instance well; it
+serialises writes, so use Postgres for several writers or several instances.
+See [capacity and scaling](docs/operations/scaling.md).
+
 ## Configuration
 
 All configuration comes from environment variables. The complete
@@ -69,7 +75,7 @@ vs optional, secrets, and `SOURCE_MODE`-only notes — is
 | `NETWORK`       | `testnet`                              | `testnet` \| `mainnet` \| `futurenet` \| `custom` |
 | `RPC_URL`       | per network                            | Stellar RPC endpoint; overrides the preset   |
 | `NETWORK_PASSPHRASE` | per network                       | Overrides the network passphrase             |
-| `DATABASE_URL`  | *(required)*                           | Postgres URL (`postgres` / `postgresql`); validated at load |
+| `DATABASE_URL`  | *(required)*                           | Backend URL by scheme: Postgres (`postgres` / `postgresql`) or a single-file SQLite database (`sqlite:///path/to/sorobeacon.db`); validated at load |
 | `DATABASE_MAX_CONNS` | pgx default                       | Pool max connections (`0` = driver default)  |
 | `DATABASE_MIN_CONNS` | pgx default                       | Pool min connections (`0` = driver default)  |
 | `DATABASE_MAX_CONN_LIFETIME` | pgx default                | Max connection lifetime (`0` = driver default) |
@@ -325,7 +331,8 @@ Layout:
 cmd/sorobeacon      wiring + graceful shutdown
 internal/config     env config
 internal/stellar    RPC client (getEvents/getLatestLedger/getHealth) + ScVal decoder
-internal/store      Postgres (pgx) + embedded golang-migrate migrations
+internal/store      Postgres (pgx) and SQLite backends + embedded
+                    golang-migrate migrations (parallel sets)
 internal/rules      RuleEvaluator interface + event_emitted, value_threshold,
                     token_event, frequency_threshold
 internal/notify     Notifier interface + 7 channels + retrying dispatcher

@@ -35,7 +35,27 @@ column; see [Channel config encryption](#channel-config-encryption).
 
 | Variable | Type | Default | Required | What it does |
 | --- | --- | --- | --- | --- |
-| `DATABASE_URL` | URL string | _(none)_ | **required** | Postgres connection string in pgx form, e.g. `postgres://user:pass@host:5432/sorobeacon?sslmode=disable`. Load fails if it is empty. |
+| `DATABASE_URL` | URL string | _(none)_ | **required** | Connection string whose scheme selects the backend. `postgres` / `postgresql` → a Postgres server (pgx pool), e.g. `postgres://user:pass@host:5432/sorobeacon?sslmode=disable`. `sqlite` → a single database file, e.g. `sqlite:///var/lib/sorobeacon/sorobeacon.db`, with no server to run. Load fails if it is empty; a Postgres URL must carry a host and a SQLite URL a file path. Errors never echo a password. |
+
+### SQLite backend
+
+`sqlite://<path>` stores everything in one file and needs no Postgres. The
+parent directory is created if it is missing, and the database runs in WAL
+mode. It is aimed at a single instance — one contract on a small VPS or a
+Raspberry Pi.
+
+**Writes serialise.** SQLite allows one writer at a time, so the store holds
+the write lock for the duration of a write transaction (it uses `BEGIN
+IMMEDIATE` and a single connection). The alert cooldown, which Postgres
+enforces with `SELECT ... FOR UPDATE`, is enforced the same way and with the
+same result — one alert per window — but write throughput is bounded by that
+one writer. Reads run concurrently under WAL. Do not point several SoroBeacon
+instances at one SQLite file; use Postgres for that.
+
+The `DATABASE_MAX_CONNS`, `DATABASE_MIN_CONNS`,
+`DATABASE_MAX_CONN_LIFETIME` and `DATABASE_MAX_CONN_IDLE_TIME` variables tune
+the **Postgres** pool. Setting any of them with a `sqlite` URL is a startup
+error rather than a setting that silently does nothing.
 
 ## API authentication
 

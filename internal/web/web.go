@@ -181,7 +181,7 @@ func New(st store.Store, reg *rules.Registry, f *notify.Factory, log *slog.Logge
 		pages:       map[string]*template.Template{},
 		silentAfter: 24 * time.Hour,
 	}
-	for _, page := range []string{"index", "monitors", "monitor", "channels", "alerts", "alert", "login", "error"} {
+	for _, page := range []string{"index", "monitors", "monitor", "channels", "alerts", "alert", "login", "error", "rulebuilder", "searches"} {
 		t, err := template.New("layout.html").Funcs(templateFuncs).ParseFS(templatesFS, "templates/layout.html", "templates/"+page+".html")
 		if err != nil {
 			return nil, fmt.Errorf("parse template %s: %w", page, err)
@@ -249,7 +249,7 @@ func (s *Server) Routes() chi.Router {
 	r.Post("/monitors/{id}/toggle", s.toggleMonitor)
 	r.Post("/monitors/{id}/delete", s.deleteMonitor)
 	r.Post("/monitors/{id}/duplicate", s.duplicateMonitor)
-	r.Post("/monitors/{id}/rules", s.createRule)
+	r.Post("/monitors/{id}/rules", s.createRuleFromBuilder)
 	r.Post("/monitors/{id}/rules/{ruleID}/toggle", s.toggleRule)
 	r.Post("/monitors/{id}/rules/{ruleID}/delete", s.deleteRule)
 	r.Post("/monitors/{id}/channels", s.setMonitorChannels)
@@ -259,6 +259,16 @@ func (s *Server) Routes() chi.Router {
 	r.Post("/channels/{id}/delete", s.deleteChannel)
 	r.Post("/channels/{id}/test", s.testChannel)
 	r.Post("/channels/{id}/toggle", s.toggleChannel)
+
+	r.Get("/rulebuilder/{type}", s.ruleBuilderFields)
+
+	r.Get("/searches", s.searches)
+	r.Post("/searches", s.createSearch)
+	r.Post("/searches/{id}/delete", s.deleteSearch)
+	r.Post("/searches/{id}/default", s.setDefaultSearch)
+	r.Post("/searches/{id}/undefault", s.clearDefaultSearch)
+
+	r.Post("/monitors/import", s.importContractsWeb)
 
 	r.Get("/alerts", s.alerts)
 	r.Get("/alerts/{id}/deliveries", s.alertDeliveries)
@@ -279,6 +289,7 @@ var navSection = map[string]string{
 	"channels": "channels",
 	"alerts":   "alerts",
 	"alert":    "alerts",
+	"searches": "alerts",
 }
 
 func (s *Server) render(w http.ResponseWriter, r *http.Request, page string, data any) {
@@ -823,29 +834,6 @@ func (s *Server) deleteMonitor(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Redirect(w, r, "/monitors", http.StatusSeeOther)
-}
-
-func (s *Server) createRule(w http.ResponseWriter, r *http.Request) {
-	id, err := pathID(r, "id")
-	if err != nil {
-		http.NotFound(w, r)
-		return
-	}
-	ruleType := r.FormValue("type")
-	params := []byte(r.FormValue("params"))
-	if len(params) == 0 {
-		params = []byte(`{}`)
-	}
-	if err := s.registry.Validate(ruleType, params); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	rule := store.Rule{MonitorID: id, Type: ruleType, Params: params, Enabled: true}
-	if err := s.store.CreateRule(r.Context(), &rule); err != nil {
-		s.fail(w, err)
-		return
-	}
-	http.Redirect(w, r, fmt.Sprintf("/monitors/%d", id), http.StatusSeeOther)
 }
 
 func (s *Server) deleteRule(w http.ResponseWriter, r *http.Request) {

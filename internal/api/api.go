@@ -147,6 +147,20 @@ func (s *Server) Routes() chi.Router {
 		r.Post("/{id}/test", s.testChannel)
 	})
 
+	r.Route("/templates", func(r chi.Router) {
+		r.Post("/", s.createTemplate)
+		r.Get("/", s.listTemplates)
+		r.Route("/{id}", func(r chi.Router) {
+			r.Get("/", s.getTemplate)
+			r.Patch("/", s.updateTemplate)
+			r.Delete("/", s.deleteTemplate)
+			r.Post("/instantiate", s.instantiateTemplate)
+			r.Post("/instantiate/bulk", s.bulkInstantiateTemplate)
+		})
+	})
+
+	r.Post("/monitors/import", s.importContracts)
+
 	r.Get("/alerts", s.listAlerts)
 	r.Get("/alerts.csv", s.exportAlertsCSV)
 	r.Get("/alerts/{id}/deliveries", s.listDeliveries)

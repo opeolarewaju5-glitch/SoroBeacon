@@ -36,6 +36,7 @@
 
 ## 📏 Operations
 
+* [Backing up and restoring the database](operations/backup-restore.md)
 * [Capacity and scaling](operations/scaling.md)
 
 ## 🛠️ Reference

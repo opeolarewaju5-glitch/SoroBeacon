@@ -378,6 +378,71 @@ type Ingest interface {
 	SetIngestState(ctx context.Context, s IngestState) error
 }
 
+// SavedSearch is a named, reusable alert filter combination.
+type SavedSearch struct {
+	ID        int64            `json:"id"`
+	Name      string           `json:"name"`
+	Filter    SavedSearchFilter `json:"filter"`
+	IsDefault bool             `json:"is_default"`
+	CreatedAt time.Time        `json:"created_at"`
+}
+
+// SavedSearchFilter stores the structured filter fields so surviving
+// renames is straightforward and stale references degrade gracefully.
+type SavedSearchFilter struct {
+	MonitorID  int64  `json:"monitor_id,omitempty"`
+	RuleID     int64  `json:"rule_id,omitempty"`
+	ContractID string `json:"contract_id,omitempty"`
+	Sort       string `json:"sort,omitempty"`
+}
+
+// SavedSearches persists saved alert searches.
+type SavedSearches interface {
+	CreateSavedSearch(ctx context.Context, s *SavedSearch) error
+	ListSavedSearches(ctx context.Context) ([]SavedSearch, error)
+	GetSavedSearch(ctx context.Context, id int64) (*SavedSearch, error)
+	DeleteSavedSearch(ctx context.Context, id int64) error
+	SetDefaultSearch(ctx context.Context, id int64) error
+	ClearDefaultSearch(ctx context.Context, id int64) error
+}
+
+// MonitorTemplate defines a reusable monitor shape. Monitors created from
+// a template are one-time copies: editing the template does not retroactively
+// change existing monitors, so operators can tweak instances without fear.
+type MonitorTemplate struct {
+	ID          int64                  `json:"id"`
+	Name        string                 `json:"name"`
+	Description string                 `json:"description"`
+	Rules       []MonitorTemplateRule  `json:"rules"`
+	ChannelIDs  []int64                `json:"channel_ids"`
+	Parameters  []TemplateParameter    `json:"parameters"`
+	CreatedAt   time.Time              `json:"created_at"`
+}
+
+// MonitorTemplateRule is one rule definition inside a template. Params may
+// contain {{param_name}} placeholders that are substituted at instantiation.
+type MonitorTemplateRule struct {
+	Type   string          `json:"type"`
+	Params json.RawMessage `json:"params"`
+}
+
+// TemplateParameter describes one substitutable value.
+type TemplateParameter struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	Required    bool   `json:"required"`
+	Default     string `json:"default,omitempty"`
+}
+
+// MonitorTemplates persists monitor templates.
+type MonitorTemplates interface {
+	CreateMonitorTemplate(ctx context.Context, t *MonitorTemplate) error
+	GetMonitorTemplate(ctx context.Context, id int64) (*MonitorTemplate, error)
+	ListMonitorTemplates(ctx context.Context) ([]MonitorTemplate, error)
+	UpdateMonitorTemplate(ctx context.Context, t *MonitorTemplate) error
+	DeleteMonitorTemplate(ctx context.Context, id int64) error
+}
+
 // Store is everything the application needs from persistence.
 type Store interface {
 	Monitors
@@ -385,6 +450,8 @@ type Store interface {
 	Channels
 	Alerts
 	Ingest
+	SavedSearches
+	MonitorTemplates
 	GetStats(ctx context.Context) (Stats, error)
 	// AlertCountsByDay returns UTC calendar-day alert totals for `days`
 	// consecutive days ending today (UTC). Days with no alerts are present

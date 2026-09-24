@@ -138,6 +138,10 @@ func Load() (Config, error) {
 	if err := validateDatabaseURL(cfg.DatabaseURL); err != nil {
 		return cfg, err
 	}
+	// The pool knobs below are Postgres-only. Knowing the backend here lets
+	// Load fail loudly when a SQLite deployment carries them instead of
+	// silently ignoring a setting the operator expects to matter.
+	sqliteBackend := isSQLiteURL(cfg.DatabaseURL)
 
 	if err := validateHTTPAddr(cfg.HTTPAddr); err != nil {
 		return cfg, err
@@ -280,6 +284,9 @@ func Load() (Config, error) {
 	if maxConns > 0 && minConns > 0 && maxConns < minConns {
 		return cfg, fmt.Errorf("DATABASE_MAX_CONNS %d is below DATABASE_MIN_CONNS %d", maxConns, minConns)
 	}
+	if sqliteBackend && (maxConns > 0 || minConns > 0 || maxLifetime > 0 || maxIdle > 0) {
+		return cfg, fmt.Errorf("DATABASE_MAX_CONNS, DATABASE_MIN_CONNS, DATABASE_MAX_CONN_LIFETIME and DATABASE_MAX_CONN_IDLE_TIME tune the Postgres pool and have no effect on a sqlite DATABASE_URL; unset them or use Postgres")
+	}
 	cfg.DatabaseMaxConns = maxConns
 	cfg.DatabaseMinConns = minConns
 	cfg.DatabaseMaxConnLifetime = maxLifetime
@@ -345,12 +352,20 @@ func (c Config) LogAttrs() []slog.Attr {
 
 // redactDatabaseURL keeps scheme, host (with port) and database name and
 // drops userinfo, query and fragment so a password never appears in logs.
+// A SQLite URL carries no credentials, so its file path — the whole database
+// — is kept; it is the one field an operator needs in the startup line.
 func redactDatabaseURL(raw string) string {
 	if raw == "" {
 		return ""
 	}
 	u, err := url.Parse(raw)
-	if err != nil || u.Scheme == "" || u.Host == "" {
+	if err != nil || u.Scheme == "" {
+		return redacted
+	}
+	if strings.EqualFold(u.Scheme, "sqlite") {
+		return u.Scheme + "://" + u.Host + u.Path
+	}
+	if u.Host == "" {
 		return redacted
 	}
 	return u.Scheme + "://" + u.Host + u.Path
@@ -417,21 +432,42 @@ const databaseURLExample = "postgres://user:pass@localhost:5432/dbname?sslmode=d
 // error that looks like the database is down. Errors name the variable and
 // never echo the raw value (it holds a password); scheme and host are safe
 // to show once the URL has parsed.
+//
+// Three schemes are supported: postgres and postgresql select the pgx pool,
+// sqlite selects a single-file database (no server, for single-node
+// deployments). The scheme decides the backend in internal/store, so a typo
+// here must not silently pick one.
 func validateDatabaseURL(raw string) error {
-	const supported = "supported schemes: postgres, postgresql"
+	const supported = "supported schemes: postgres, postgresql, sqlite"
 	if strings.TrimSpace(raw) == "" {
-		return fmt.Errorf("DATABASE_URL is required (e.g. %s)", databaseURLExample)
+		return fmt.Errorf("DATABASE_URL is required (e.g. %s, or sqlite:///var/lib/sorobeacon/sorobeacon.db)", databaseURLExample)
 	}
 	u, err := url.Parse(raw)
-	if err != nil || u.Scheme == "" || u.Host == "" {
+	if err != nil || u.Scheme == "" {
 		return fmt.Errorf("DATABASE_URL is not a parseable URL (%s)", supported)
 	}
 	switch strings.ToLower(u.Scheme) {
 	case "postgres", "postgresql":
+		if u.Host == "" {
+			return fmt.Errorf("DATABASE_URL is not a parseable URL (%s)", supported)
+		}
+		return nil
+	case "sqlite":
+		if u.Opaque == "" && u.Host == "" && u.Path == "" {
+			return fmt.Errorf("DATABASE_URL sqlite URL is missing a database file path (e.g. sqlite:///var/lib/sorobeacon/sorobeacon.db)")
+		}
 		return nil
 	default:
 		return fmt.Errorf("DATABASE_URL scheme %q (host %s) is not supported (%s)", u.Scheme, u.Host, supported)
 	}
+}
+
+// isSQLiteURL reports whether raw selects the SQLite backend. It is a
+// best-effort parse: an unparseable value has already been rejected by
+// validateDatabaseURL, so a false here simply means "not sqlite".
+func isSQLiteURL(raw string) bool {
+	u, err := url.Parse(raw)
+	return err == nil && strings.EqualFold(u.Scheme, "sqlite")
 }
 
 // parseAPITokens splits API_TOKEN on commas into the accepted bearer

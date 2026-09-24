@@ -712,6 +712,54 @@ func TestLoadAcceptsValidDatabaseURL(t *testing.T) {
 	}
 }
 
+// DATABASE_URL=sqlite://... must load: it is the backend that lets a
+// single-node deployment run without Postgres at all.
+func TestLoadAcceptsSQLiteDatabaseURL(t *testing.T) {
+	const url = "sqlite:///var/lib/sorobeacon/sorobeacon.db"
+	t.Setenv("DATABASE_URL", url)
+	t.Setenv("DATABASE_MAX_CONNS", "")
+	t.Setenv("DATABASE_MIN_CONNS", "")
+	t.Setenv("DATABASE_MAX_CONN_LIFETIME", "")
+	t.Setenv("DATABASE_MAX_CONN_IDLE_TIME", "")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, url, cfg.DatabaseURL)
+}
+
+func TestValidateDatabaseURLSQLite(t *testing.T) {
+	for _, raw := range []string{
+		"sqlite:///var/lib/sorobeacon/sorobeacon.db",
+		"sqlite://relative.db",
+		"sqlite:./data/sorobeacon.db",
+	} {
+		require.NoError(t, validateDatabaseURL(raw), raw)
+	}
+	err := validateDatabaseURL("sqlite://")
+	require.Error(t, err, "a sqlite URL with no file path cannot work")
+	assert.ErrorContains(t, err, "file path")
+}
+
+// The pool knobs tune the Postgres connection pool. Carrying them into a
+// SQLite deployment would silently do nothing, so Load fails loudly instead.
+func TestLoadRejectsPostgresPoolSettingsWithSQLite(t *testing.T) {
+	t.Setenv("DATABASE_URL", "sqlite:///tmp/sorobeacon.db")
+	t.Setenv("DATABASE_MAX_CONNS", "4")
+
+	_, err := Load()
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "DATABASE_MAX_CONNS")
+	assert.ErrorContains(t, err, "sqlite")
+}
+
+// A SQLite URL holds no credentials, so the log line keeps the file path
+// rather than replacing the whole URL with [redacted].
+func TestRedactDatabaseURLSQLiteKeepsPath(t *testing.T) {
+	assert.Equal(t, "sqlite:///var/lib/sorobeacon/sorobeacon.db",
+		redactDatabaseURL("sqlite:///var/lib/sorobeacon/sorobeacon.db"))
+	assert.Equal(t, "sqlite://relative.db", redactDatabaseURL("sqlite://relative.db?cache=shared"))
+}
+
 func TestLoadRejectsInvalidDatabaseURL(t *testing.T) {
 	const secret = "s3cret-password"
 	tests := []struct {

@@ -47,6 +47,23 @@ func (emptyStore) ListMonitorsPage(context.Context, store.ListFilter) ([]store.M
 func (emptyStore) ListChannelsPage(context.Context, store.ListFilter) ([]store.Channel, error) {
 	return nil, nil
 }
+func (emptyStore) ListSavedSearches(context.Context) ([]store.SavedSearch, error) { return nil, nil }
+func (emptyStore) CreateSavedSearch(context.Context, *store.SavedSearch) error   { return nil }
+func (emptyStore) GetSavedSearch(context.Context, int64) (*store.SavedSearch, error) {
+	return nil, store.ErrNotFound
+}
+func (emptyStore) DeleteSavedSearch(context.Context, int64) error        { return nil }
+func (emptyStore) SetDefaultSearch(context.Context, int64) error         { return nil }
+func (emptyStore) ClearDefaultSearch(context.Context, int64) error       { return nil }
+func (emptyStore) CreateMonitorTemplate(context.Context, *store.MonitorTemplate) error { return nil }
+func (emptyStore) GetMonitorTemplate(context.Context, int64) (*store.MonitorTemplate, error) {
+	return nil, store.ErrNotFound
+}
+func (emptyStore) ListMonitorTemplates(context.Context) ([]store.MonitorTemplate, error) {
+	return nil, nil
+}
+func (emptyStore) UpdateMonitorTemplate(context.Context, *store.MonitorTemplate) error { return nil }
+func (emptyStore) DeleteMonitorTemplate(context.Context, int64) error                  { return nil }
 
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
