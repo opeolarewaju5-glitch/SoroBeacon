@@ -16,6 +16,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/sorotrail/sorobeacon/internal/api"
+	"github.com/sorotrail/sorobeacon/internal/archive"
 	"github.com/sorotrail/sorobeacon/internal/auth"
 	"github.com/sorotrail/sorobeacon/internal/config"
 	"github.com/sorotrail/sorobeacon/internal/metrics"
@@ -89,6 +90,15 @@ func run() error {
 	defer st.Close()
 	log.Info("database ready", "backend", store.BackendName(cfg.DatabaseURL))
 
+	// Postgres partitions alerts by month. Make sure the months just ahead
+	// exist before the poller can write into them, so a row never has to fall
+	// back to the default partition under normal operation. A no-op on SQLite.
+	if pe, ok := st.(store.PartitionEnsurer); ok {
+		if err := pe.EnsureAlertPartitions(ctx, time.Now().UTC(), 3); err != nil {
+			return err
+		}
+	}
+
 	// Pipeline: event source -> rules -> alerts -> channels. The source is
 	// the single seam between the poller and wherever events come from.
 	var src poller.EventSource
@@ -150,6 +160,10 @@ func run() error {
 		WithMetrics(m).
 		WithDisableAfterFailures(cfg.ChannelDisableAfterFailures)
 	p := poller.New(src, st, registry, dispatcher, cfg.PollInterval, log).WithMetrics(m)
+	dispatcher := notify.NewDispatcher(st, factory, log).WithMetrics(m)
+	p := poller.New(src, st, registry, dispatcher, cfg.PollInterval, log).
+		WithMetrics(m).
+		WithReorg(cfg.ReorgTrackingWindow, cfg.ReorgConfirmationDepth)
 
 	// HTTP: JSON API under /api/v1, dashboard at /.
 	apiSrv := api.New(st, registry, factory, health, log).
@@ -200,8 +214,30 @@ func run() error {
 		}
 	}()
 	go p.Run(ctx)
+	// Retention can tier expired alerts to object storage before deleting
+	// them. Off by default: an empty ARCHIVE_URL leaves the pruner behaving
+	// exactly as it did before archiving existed.
+	var archiver store.AlertArchiver
+	if cfg.ArchiveURL != "" {
+		back, err := archive.FromURL(cfg.ArchiveURL)
+		if err != nil {
+			return err
+		}
+		pruner, err := archive.NewPruner(back)
+		if err != nil {
+			return err
+		}
+		archiver = pruner
+		// Never log the URL: an operator may embed an endpoint or token in a
+		// query string. The scheme is enough to confirm what was selected.
+		log.Info("alert archiving enabled")
+	}
 	if cfg.AlertRetention > 0 {
-		go store.RunAlertPruner(ctx, st, cfg.AlertRetention, store.DefaultPruneInterval, store.DefaultPruneBatch, log)
+		go store.RunAlertPruner(ctx, st, cfg.AlertRetention, store.DefaultPruneInterval, store.DefaultPruneBatch, archiver, log)
+	} else if archiver != nil {
+		// Archiving only happens before a delete, so it is inert without
+		// retention. Warn rather than silently doing nothing.
+		log.Warn("ARCHIVE_URL is set but ALERT_RETENTION is unset; nothing will be archived or deleted")
 	}
 
 	select {

@@ -26,6 +26,11 @@ const (
 	// DefaultMonitorSilentAfter is how long since last_matched_at before
 	// the monitors list treats a monitor as silent.
 	DefaultMonitorSilentAfter = 24 * time.Hour
+	// DefaultReorgTrackingWindow is how many recent ledger hashes the poller
+	// keeps for reorg detection. 128 ledgers is roughly ten minutes on
+	// Stellar and a few getLedgers pages per cycle — cheap, and deep enough
+	// to cover the practical reorg depth.
+	DefaultReorgTrackingWindow uint32 = 128
 )
 
 // Config holds all runtime configuration. Every field maps to one
@@ -114,6 +119,21 @@ type Config struct {
 	// worse outcome than the failure it would fix, so opting in is the
 	// operator's call.
 	ChannelDisableAfterFailures int
+	// ReorgTrackingWindow is how many recent ledgers' hashes the poller keeps
+	// and re-checks each cycle for reorg detection
+	// (REORG_TRACKING_WINDOW, default 128). Zero disables detection, which is
+	// the behaviour before the feature existed.
+	ReorgTrackingWindow uint32
+	// ReorgConfirmationDepth is how many ledgers behind the tip an event must
+	// be before it may alert (REORG_CONFIRMATION_DEPTH, default 0). Zero
+	// alerts immediately, the historical default.
+	ReorgConfirmationDepth uint32
+	// ArchiveURL is where retention copies alerts before deleting them
+	// (ARCHIVE_URL). Empty (the default) leaves archiving off, so retention
+	// behaves exactly as it did before the feature. A local directory path,
+	// file://, dir:// or s3://bucket/prefix are accepted; the archive package
+	// validates it when the pruner is built.
+	ArchiveURL string
 }
 
 // Load reads configuration from the environment. DATABASE_URL is the only
@@ -133,6 +153,10 @@ func Load() (Config, error) {
 		HTTPMaxBodyBytes:   DefaultHTTPMaxBodyBytes,
 		LogLevel:           slog.LevelInfo,
 		MonitorSilentAfter: DefaultMonitorSilentAfter,
+		// Detection is on by default; confirmation depth off, so a monitor
+		// alerts exactly as soon as it did before this feature.
+		ReorgTrackingWindow:    DefaultReorgTrackingWindow,
+		ReorgConfirmationDepth: 0,
 	}
 
 	if err := validateDatabaseURL(cfg.DatabaseURL); err != nil {
@@ -303,6 +327,21 @@ func Load() (Config, error) {
 		}
 		cfg.AlertRetention = d
 	}
+	if v := os.Getenv("REORG_TRACKING_WINDOW"); v != "" {
+		n, err := strconv.ParseUint(v, 10, 32)
+		if err != nil {
+			return cfg, fmt.Errorf("invalid REORG_TRACKING_WINDOW %q: must be a non-negative integer", v)
+		}
+		cfg.ReorgTrackingWindow = uint32(n)
+	}
+	if v := os.Getenv("REORG_CONFIRMATION_DEPTH"); v != "" {
+		n, err := strconv.ParseUint(v, 10, 32)
+		if err != nil {
+			return cfg, fmt.Errorf("invalid REORG_CONFIRMATION_DEPTH %q: must be a non-negative integer", v)
+		}
+		cfg.ReorgConfirmationDepth = uint32(n)
+	}
+	cfg.ArchiveURL = strings.TrimSpace(os.Getenv("ARCHIVE_URL"))
 
 	return cfg, nil
 }
@@ -343,6 +382,8 @@ func (c Config) LogAttrs() []slog.Attr {
 		slog.String("sorotrail_url", c.SoroTrailURL),
 		slog.String("cors_allowed_origins", strings.Join(c.CORSAllowedOrigins, ",")),
 		slog.Bool("config_encryption_enabled", len(c.ConfigEncryptionKey) > 0),
+		slog.Uint64("reorg_tracking_window", uint64(c.ReorgTrackingWindow)),
+		slog.Uint64("reorg_confirmation_depth", uint64(c.ReorgConfirmationDepth)),
 		// The count, never the tokens themselves: LogAttrs is the one place
 		// configuration is printed, and an API token is a credential.
 		slog.Int("api_token_count", len(c.APITokens)),

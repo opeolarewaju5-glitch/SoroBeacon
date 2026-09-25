@@ -93,6 +93,28 @@ func (c *HTTPClient) GetEvents(ctx context.Context, req GetEventsRequest) (*GetE
 	return &res, nil
 }
 
+// GetLedgers calls the getLedgers method, which returns ledger identity
+// (hash, sequence) for a range. The poller uses it to track the hash of every
+// recently ingested ledger so a reorg that rewrites one shows up as a changed
+// hash rather than being silently ingested.
+func (c *HTTPClient) GetLedgers(ctx context.Context, req GetLedgersRequest) (*GetLedgersResult, error) {
+	if req.Pagination == nil || req.Pagination.Limit == 0 {
+		cursor := ""
+		if req.Pagination != nil {
+			cursor = req.Pagination.Cursor
+		}
+		req.Pagination = &Pagination{Cursor: cursor, Limit: DefaultLedgersLimit}
+	}
+	if req.Pagination.Cursor != "" {
+		req.StartLedger = 0
+	}
+	var res GetLedgersResult
+	if err := c.call(ctx, "getLedgers", req, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
 func (c *HTTPClient) GetLatestLedger(ctx context.Context) (*LatestLedger, error) {
 	var res LatestLedger
 	if err := c.call(ctx, "getLatestLedger", struct{}{}, &res); err != nil {

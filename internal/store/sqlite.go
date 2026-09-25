@@ -218,9 +218,9 @@ func (s *SQLite) CreateMonitor(ctx context.Context, m *Monitor) error {
 	}
 	var created string
 	if err := s.db.QueryRowContext(ctx,
-		`INSERT INTO monitors (name, contract_ids, enabled) VALUES (?, ?, ?)
+		`INSERT INTO monitors (name, contract_ids, enabled, priority) VALUES (?, ?, ?, ?)
 		 RETURNING id, created_at`,
-		m.Name, string(ids), boolToInt(m.Enabled),
+		m.Name, string(ids), boolToInt(m.Enabled), string(m.Priority.Normalized()),
 	).Scan(&m.ID, &created); err != nil {
 		return mapSQLiteErr(err)
 	}
@@ -230,7 +230,7 @@ func (s *SQLite) CreateMonitor(ctx context.Context, m *Monitor) error {
 
 func (s *SQLite) GetMonitor(ctx context.Context, id int64) (*Monitor, error) {
 	m, err := scanSQLiteMonitor(s.db.QueryRowContext(ctx,
-		`SELECT id, name, contract_ids, enabled, created_at, last_matched_at FROM monitors WHERE id = ?`, id))
+		`SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority FROM monitors WHERE id = ?`, id))
 	if err != nil {
 		return nil, err
 	}
@@ -260,7 +260,7 @@ func (s *SQLite) monitorChannelIDs(ctx context.Context, monitorID int64) ([]int6
 }
 
 func (s *SQLite) ListMonitors(ctx context.Context, enabledOnly bool) ([]Monitor, error) {
-	q := `SELECT id, name, contract_ids, enabled, created_at, last_matched_at FROM monitors`
+	q := `SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority FROM monitors`
 	if enabledOnly {
 		q += ` WHERE enabled = 1`
 	}
@@ -286,7 +286,7 @@ func (s *SQLite) queryMonitors(ctx context.Context, q string, args ...any) ([]Mo
 }
 
 func (s *SQLite) ListMonitorsPage(ctx context.Context, f ListFilter) ([]Monitor, error) {
-	q := `SELECT id, name, contract_ids, enabled, created_at, last_matched_at FROM monitors WHERE 1 = 1`
+	q := `SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority FROM monitors WHERE 1 = 1`
 	args := []any{}
 	if f.Query != "" {
 		// instr + lower is a parameterized substring match without LIKE
@@ -333,8 +333,8 @@ func (s *SQLite) UpdateMonitor(ctx context.Context, m *Monitor) error {
 		return err
 	}
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE monitors SET name = ?, contract_ids = ?, enabled = ? WHERE id = ?`,
-		m.Name, string(ids), boolToInt(m.Enabled), m.ID)
+		`UPDATE monitors SET name = ?, contract_ids = ?, enabled = ?, priority = ? WHERE id = ?`,
+		m.Name, string(ids), boolToInt(m.Enabled), string(m.Priority.Normalized()), m.ID)
 	if err != nil {
 		return mapSQLiteErr(err)
 	}
@@ -433,7 +433,7 @@ func (s *SQLite) DuplicateMonitor(ctx context.Context, id int64) (*Monitor, erro
 	defer func() { _ = tx.Rollback() }() // rollback after commit is a no-op
 
 	src, err := scanSQLiteMonitor(tx.QueryRowContext(ctx,
-		`SELECT id, name, contract_ids, enabled, created_at, last_matched_at FROM monitors WHERE id = ?`, id))
+		`SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority FROM monitors WHERE id = ?`, id))
 	if err != nil {
 		return nil, err
 	}
@@ -459,12 +459,13 @@ func (s *SQLite) DuplicateMonitor(ctx context.Context, id int64) (*Monitor, erro
 	dup := Monitor{
 		Name:        CopyMonitorName(src.Name, names),
 		ContractIDs: src.ContractIDs,
-		Enabled:     false, // never inherit enabled: a duplicate must be reviewed first
+		Enabled:     false,                     // never inherit enabled: a duplicate must be reviewed first
+		Priority:    src.Priority.Normalized(), // priority is queue position, not a safety switch, so the copy keeps it
 	}
 	var created string
 	if err := tx.QueryRowContext(ctx,
-		`INSERT INTO monitors (name, contract_ids, enabled) VALUES (?, ?, ?) RETURNING id, created_at`,
-		dup.Name, string(ids), boolToInt(dup.Enabled),
+		`INSERT INTO monitors (name, contract_ids, enabled, priority) VALUES (?, ?, ?, ?) RETURNING id, created_at`,
+		dup.Name, string(ids), boolToInt(dup.Enabled), string(dup.Priority),
 	).Scan(&dup.ID, &created); err != nil {
 		return nil, mapSQLiteErr(err)
 	}
@@ -543,9 +544,11 @@ func scanSQLiteMonitor(r rowScanner) (*Monitor, error) {
 	var enabled int64
 	var created string
 	var lastMatched sql.NullString
-	if err := r.Scan(&m.ID, &m.Name, &ids, &enabled, &created, &lastMatched); err != nil {
+	var priority string
+	if err := r.Scan(&m.ID, &m.Name, &ids, &enabled, &created, &lastMatched, &priority); err != nil {
 		return nil, mapSQLiteErr(err)
 	}
+	m.Priority = Priority(priority).Normalized()
 	m.Enabled = enabled != 0
 	if err := json.Unmarshal([]byte(ids), &m.ContractIDs); err != nil {
 		return nil, fmt.Errorf("monitor %d: bad contract_ids: %w", m.ID, err)
@@ -957,10 +960,10 @@ func (s *SQLite) CreateAlert(ctx context.Context, a *Alert) (AlertOutcome, error
 	var id int64
 	var created string
 	err = tx.QueryRowContext(ctx,
-		`INSERT INTO alerts (monitor_id, rule_id, event_id, payload) VALUES (?, ?, ?, ?)
+		`INSERT INTO alerts (monitor_id, rule_id, event_id, payload, ledger) VALUES (?, ?, ?, ?, ?)
 		 ON CONFLICT (rule_id, event_id) DO NOTHING
 		 RETURNING id, created_at`,
-		a.MonitorID, a.RuleID, a.EventID, string(jsonOrEmpty(a.Payload)),
+		a.MonitorID, a.RuleID, a.EventID, string(jsonOrEmpty(a.Payload)), int64(a.Ledger),
 	).Scan(&id, &created)
 	if errors.Is(err, sql.ErrNoRows) {
 		return AlertDuplicate, nil // duplicate (rule_id, event_id): deduped
@@ -1001,7 +1004,7 @@ func (s *SQLite) CreateAlert(ctx context.Context, a *Alert) (AlertOutcome, error
 
 func (s *SQLite) GetAlert(ctx context.Context, id int64) (*Alert, error) {
 	a, err := scanSQLiteAlert(s.db.QueryRowContext(ctx,
-		`SELECT id, monitor_id, rule_id, event_id, payload, created_at FROM alerts WHERE id = ?`, id))
+		`SELECT id, monitor_id, rule_id, event_id, payload, created_at, ledger, retracted_at FROM alerts WHERE id = ?`, id))
 	if err != nil {
 		return nil, err
 	}
@@ -1009,7 +1012,7 @@ func (s *SQLite) GetAlert(ctx context.Context, id int64) (*Alert, error) {
 }
 
 func (s *SQLite) ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, error) {
-	q := `SELECT id, monitor_id, rule_id, event_id, payload, created_at FROM alerts WHERE 1 = 1`
+	q := `SELECT id, monitor_id, rule_id, event_id, payload, created_at, ledger, retracted_at FROM alerts WHERE 1 = 1`
 	args := []any{}
 	if f.MonitorID != 0 {
 		q += ` AND monitor_id = ?`
@@ -1072,13 +1075,23 @@ func scanSQLiteAlert(r rowScanner) (Alert, error) {
 	var a Alert
 	var payload string
 	var created string
-	if err := r.Scan(&a.ID, &a.MonitorID, &a.RuleID, &a.EventID, &payload, &created); err != nil {
+	var ledger int64
+	var retracted sql.NullString
+	if err := r.Scan(&a.ID, &a.MonitorID, &a.RuleID, &a.EventID, &payload, &created, &ledger, &retracted); err != nil {
 		return a, mapSQLiteErr(err)
 	}
 	a.Payload = json.RawMessage(payload)
+	a.Ledger = uint32(ledger)
 	var err error
 	if a.CreatedAt, err = parseSQLiteTime(created); err != nil {
 		return a, err
+	}
+	if retracted.Valid && retracted.String != "" {
+		t, err := parseSQLiteTime(retracted.String)
+		if err != nil {
+			return a, err
+		}
+		a.RetractedAt = &t
 	}
 	return a, nil
 }
@@ -1146,6 +1159,91 @@ func (s *SQLite) DeleteExpiredAlerts(ctx context.Context, cutoff time.Time, limi
 			ORDER BY created_at ASC, id ASC
 			LIMIT ?
 		)`, sqliteTimeString(cutoff), limit)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// ExpiredAlerts returns up to limit alerts older than cutoff, oldest first,
+// with the same ordering DeleteExpiredAlerts uses.
+func (s *SQLite) ExpiredAlerts(ctx context.Context, cutoff time.Time, limit int) ([]Alert, error) {
+	if limit <= 0 {
+		limit = DefaultPruneBatch
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, monitor_id, rule_id, event_id, payload, created_at, ledger, retracted_at
+		   FROM alerts WHERE created_at < ? ORDER BY created_at ASC, id ASC LIMIT ?`,
+		sqliteTimeString(cutoff), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []Alert
+	for rows.Next() {
+		a, err := scanSQLiteAlert(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+// --- ledger hashes and reorg retraction ---
+
+func (s *SQLite) RecordLedgerHashes(ctx context.Context, hashes []LedgerHash) error {
+	if len(hashes) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }() // rollback after commit is a no-op
+	for _, h := range hashes {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO ledger_hashes (ledger, hash) VALUES (?, ?)
+			 ON CONFLICT (ledger) DO UPDATE SET hash = excluded.hash,
+			                                   observed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+			 WHERE ledger_hashes.hash IS NOT excluded.hash`,
+			int64(h.Ledger), h.Hash); err != nil {
+			return mapSQLiteErr(err)
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *SQLite) LedgerHashes(ctx context.Context, from, to uint32) ([]LedgerHash, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT ledger, hash FROM ledger_hashes WHERE ledger >= ? AND ledger <= ? ORDER BY ledger`,
+		int64(from), int64(to))
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []LedgerHash
+	for rows.Next() {
+		var h LedgerHash
+		var ledger int64
+		if err := rows.Scan(&ledger, &h.Hash); err != nil {
+			return nil, err
+		}
+		h.Ledger = uint32(ledger)
+		out = append(out, h)
+	}
+	return out, rows.Err()
+}
+
+func (s *SQLite) PruneLedgerHashes(ctx context.Context, before uint32) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM ledger_hashes WHERE ledger < ?`, int64(before))
+	return err
+}
+
+func (s *SQLite) RetractAlertsFromLedger(ctx context.Context, ledger uint32, at time.Time) (int64, error) {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE alerts SET retracted_at = ? WHERE ledger >= ? AND retracted_at IS NULL`,
+		sqliteTimeString(at), int64(ledger))
 	if err != nil {
 		return 0, err
 	}
@@ -1255,6 +1353,13 @@ func (s *SQLite) CreateSavedSearch(ctx context.Context, search *SavedSearch) err
 
 	if search.IsDefault {
 		if _, err := tx.ExecContext(ctx, `UPDATE saved_searches SET is_default = 0 WHERE is_default = 1`); err != nil {
+func (s *SQLite) CreateSavedSearch(ctx context.Context, ss *SavedSearch) error {
+	filter, err := json.Marshal(ss.Filter)
+	if err != nil {
+		return err
+	}
+	if ss.IsDefault {
+		if _, err := s.db.ExecContext(ctx, `UPDATE saved_searches SET is_default = 0 WHERE is_default = 1`); err != nil {
 			return err
 		}
 	}
@@ -1268,6 +1373,13 @@ func (s *SQLite) CreateSavedSearch(ctx context.Context, search *SavedSearch) err
 		return err
 	}
 	return tx.Commit()
+	if err := s.db.QueryRowContext(ctx,
+		`INSERT INTO saved_searches (name, filter, is_default) VALUES (?, ?, ?) RETURNING id, created_at`,
+		ss.Name, string(filter), boolToInt(ss.IsDefault)).Scan(&ss.ID, &created); err != nil {
+		return mapSQLiteErr(err)
+	}
+	ss.CreatedAt, err = parseSQLiteTime(created)
+	return err
 }
 
 func (s *SQLite) ListSavedSearches(ctx context.Context) ([]SavedSearch, error) {
@@ -1284,12 +1396,18 @@ func (s *SQLite) ListSavedSearches(ctx context.Context) ([]SavedSearch, error) {
 			return nil, err
 		}
 		out = append(out, search)
+		ss, err := scanSQLiteSavedSearch(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ss)
 	}
 	return out, rows.Err()
 }
 
 func (s *SQLite) GetSavedSearch(ctx context.Context, id int64) (*SavedSearch, error) {
 	search, err := scanSQLiteSavedSearch(s.db.QueryRowContext(ctx,
+	ss, err := scanSQLiteSavedSearch(s.db.QueryRowContext(ctx,
 		`SELECT id, name, filter, is_default, created_at FROM saved_searches WHERE id = ?`, id))
 	if err != nil {
 		return nil, err
@@ -1316,6 +1434,24 @@ func scanSQLiteSavedSearch(r rowScanner) (SavedSearch, error) {
 		return s, err
 	}
 	return s, nil
+	return &ss, nil
+}
+
+func scanSQLiteSavedSearch(r rowScanner) (SavedSearch, error) {
+	var ss SavedSearch
+	var filter string
+	var isDefault int64
+	var created string
+	if err := r.Scan(&ss.ID, &ss.Name, &filter, &isDefault, &created); err != nil {
+		return ss, mapSQLiteErr(err)
+	}
+	ss.IsDefault = isDefault != 0
+	_ = json.Unmarshal([]byte(filter), &ss.Filter)
+	var err error
+	if ss.CreatedAt, err = parseSQLiteTime(created); err != nil {
+		return ss, err
+	}
+	return ss, nil
 }
 
 func (s *SQLite) DeleteSavedSearch(ctx context.Context, id int64) error {
@@ -1325,6 +1461,8 @@ func (s *SQLite) DeleteSavedSearch(ctx context.Context, id int64) error {
 // SetDefaultSearch promotes one saved search and demotes the previous default
 // in one transaction, so the partial unique index is never violated and two
 // callers cannot both believe they set the default.
+// SetDefaultSearch clears any existing default and sets the requested row in
+// one transaction, so the partial unique index never sees two defaults.
 func (s *SQLite) SetDefaultSearch(ctx context.Context, id int64) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -1393,6 +1531,18 @@ func (s *SQLite) CreateMonitorTemplate(ctx context.Context, tpl *MonitorTemplate
 		return mapSQLiteErr(err)
 	}
 	tpl.CreatedAt, err = parseSQLiteTime(created)
+func (s *SQLite) CreateMonitorTemplate(ctx context.Context, t *MonitorTemplate) error {
+	rulesJSON, _ := json.Marshal(t.Rules)
+	channelJSON, _ := json.Marshal(t.ChannelIDs)
+	paramsJSON, _ := json.Marshal(t.Parameters)
+	var created string
+	if err := s.db.QueryRowContext(ctx,
+		`INSERT INTO monitor_templates (name, description, rules, channel_ids, parameters) VALUES (?, ?, ?, ?, ?) RETURNING id, created_at`,
+		t.Name, t.Description, string(rulesJSON), string(channelJSON), string(paramsJSON)).Scan(&t.ID, &created); err != nil {
+		return mapSQLiteErr(err)
+	}
+	var err error
+	t.CreatedAt, err = parseSQLiteTime(created)
 	return err
 }
 
@@ -1404,12 +1554,19 @@ func (s *SQLite) GetMonitorTemplate(ctx context.Context, id int64) (*MonitorTemp
 		return nil, err
 	}
 	return &tpl, nil
+	t, err := scanSQLiteTemplate(s.db.QueryRowContext(ctx,
+		`SELECT id, name, description, rules, channel_ids, parameters, created_at FROM monitor_templates WHERE id = ?`, id))
+	if err != nil {
+		return nil, err
+	}
+	return &t, nil
 }
 
 func (s *SQLite) ListMonitorTemplates(ctx context.Context) ([]MonitorTemplate, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, name, description, rules, channel_ids, parameters, created_at
 		 FROM monitor_templates ORDER BY name`)
+		`SELECT id, name, description, rules, channel_ids, parameters, created_at FROM monitor_templates ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -1421,6 +1578,11 @@ func (s *SQLite) ListMonitorTemplates(ctx context.Context) ([]MonitorTemplate, e
 			return nil, err
 		}
 		out = append(out, tpl)
+		t, err := scanSQLiteTemplate(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, t)
 	}
 	return out, rows.Err()
 }
@@ -1464,6 +1626,32 @@ func (s *SQLite) UpdateMonitorTemplate(ctx context.Context, tpl *MonitorTemplate
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE monitor_templates SET name = ?, description = ?, rules = ?, channel_ids = ?, parameters = ? WHERE id = ?`,
 		tpl.Name, tpl.Description, string(rulesJSON), string(channelsJSON), string(paramsJSON), tpl.ID)
+func scanSQLiteTemplate(r rowScanner) (MonitorTemplate, error) {
+	var t MonitorTemplate
+	var rulesJSON, channelJSON, paramsJSON, created string
+	if err := r.Scan(&t.ID, &t.Name, &t.Description, &rulesJSON, &channelJSON, &paramsJSON, &created); err != nil {
+		return t, mapSQLiteErr(err)
+	}
+	_ = json.Unmarshal([]byte(rulesJSON), &t.Rules)
+	_ = json.Unmarshal([]byte(channelJSON), &t.ChannelIDs)
+	_ = json.Unmarshal([]byte(paramsJSON), &t.Parameters)
+	if t.ChannelIDs == nil {
+		t.ChannelIDs = []int64{}
+	}
+	var err error
+	if t.CreatedAt, err = parseSQLiteTime(created); err != nil {
+		return t, err
+	}
+	return t, nil
+}
+
+func (s *SQLite) UpdateMonitorTemplate(ctx context.Context, t *MonitorTemplate) error {
+	rulesJSON, _ := json.Marshal(t.Rules)
+	channelJSON, _ := json.Marshal(t.ChannelIDs)
+	paramsJSON, _ := json.Marshal(t.Parameters)
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE monitor_templates SET name = ?, description = ?, rules = ?, channel_ids = ?, parameters = ? WHERE id = ?`,
+		t.Name, t.Description, string(rulesJSON), string(channelJSON), string(paramsJSON), t.ID)
 	if err != nil {
 		return mapSQLiteErr(err)
 	}

@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/sorotrail/sorobeacon/internal/stellar"
+	"github.com/sorotrail/sorobeacon/internal/store"
 )
 
 // RPCSource reads events from a Stellar RPC node's getEvents and decodes
@@ -198,4 +199,62 @@ func groupFilters(filters []stellar.EventFilter) [][]stellar.EventFilter {
 	return groups
 }
 
+// ledgerGetter is the getLedgers capability of the RPC client. It is a narrow
+// interface rather than a method on stellar.Client so sources and test
+// doubles that do not care about reorg detection need not implement it.
+type ledgerGetter interface {
+	GetLedgers(ctx context.Context, req stellar.GetLedgersRequest) (*stellar.GetLedgersResult, error)
+}
+
+// LedgerHashes pages getLedgers across the inclusive range [from, to]. A
+// client that cannot answer getLedgers (an older node, or a test double)
+// reports ErrLedgerHashesUnsupported, and the poller skips reorg detection for
+// that source instead of failing the cycle.
+func (s *RPCSource) LedgerHashes(ctx context.Context, from, to uint32) ([]store.LedgerHash, error) {
+	if from > to {
+		return nil, nil
+	}
+	getter, ok := s.rpc.(ledgerGetter)
+	if !ok {
+		return nil, ErrLedgerHashesUnsupported
+	}
+
+	// One page is enough for the common case (the tracking window is far
+	// below the page cap); the loop covers a larger configured window.
+	limit := to - from + 1
+	if limit > stellar.DefaultLedgersLimit {
+		limit = stellar.DefaultLedgersLimit
+	}
+	var out []store.LedgerHash
+	cursor := ""
+	for {
+		req := stellar.GetLedgersRequest{
+			StartLedger: from,
+			Pagination:  &stellar.Pagination{Cursor: cursor, Limit: int(limit)},
+		}
+		if cursor != "" {
+			req.StartLedger = 0
+		}
+		res, err := getter.GetLedgers(ctx, req)
+		if err != nil {
+			return nil, err
+		}
+		for _, l := range res.Ledgers {
+			if l.Sequence < from {
+				continue
+			}
+			if l.Sequence > to {
+				return out, nil
+			}
+			out = append(out, store.LedgerHash{Ledger: l.Sequence, Hash: l.Hash})
+		}
+		if res.Cursor == "" || len(res.Ledgers) == 0 {
+			break
+		}
+		cursor = res.Cursor
+	}
+	return out, nil
+}
+
 var _ EventSource = (*RPCSource)(nil)
+var _ LedgerHashSource = (*RPCSource)(nil)

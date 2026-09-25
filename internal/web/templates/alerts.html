@@ -36,7 +36,7 @@
         <div class="muted">loading…</div>
       </details>
     </td>
-    <td>{{formatTime .CreatedAt $.Timezone}}{{with relTime .CreatedAt}} <span class="muted">({{.}})</span>{{end}}</td>
+    <td>{{if .RetractedAt}}<span class="pill off" title="orphaned by a chain reorg">retracted</span> {{end}}{{formatTime .CreatedAt $.Timezone}}{{with relTime .CreatedAt}} <span class="muted">({{.}})</span>{{end}}</td>
   </tr>
   {{end}}
 </table>

@@ -40,6 +40,12 @@ type Store interface {
 	CreateAlert(ctx context.Context, a *store.Alert) (store.AlertOutcome, error)
 	GetIngestState(ctx context.Context) (store.IngestState, error)
 	SetIngestState(ctx context.Context, s store.IngestState) error
+	// The ledger-hash window backing reorg detection, and the retraction
+	// write that marks alerts orphaned by a reorg.
+	RecordLedgerHashes(ctx context.Context, hashes []store.LedgerHash) error
+	LedgerHashes(ctx context.Context, from, to uint32) ([]store.LedgerHash, error)
+	PruneLedgerHashes(ctx context.Context, before uint32) error
+	RetractAlertsFromLedger(ctx context.Context, ledger uint32, at time.Time) (int64, error)
 }
 
 // Dispatcher receives every newly created alert. Implemented by
@@ -65,6 +71,16 @@ type Poller struct {
 	// pos is the last successful poll snapshot, stored as Position.
 	// atomic.Value so HTTP handlers can read it without a mutex.
 	pos atomic.Value
+	// sched orders each cycle's watch list by monitor priority. It carries
+	// rotation state between cycles, so a contract cannot be permanently
+	// last within its tier.
+	sched *Scheduler
+	// reorgWindow is how many recent ledgers' hashes are kept and re-checked
+	// each cycle. Zero disables reorg detection (the pre-feature behaviour).
+	reorgWindow uint32
+	// confirmDepth is how many ledgers behind the tip an event must be before
+	// it may alert. Zero alerts immediately, which is the historical default.
+	confirmDepth uint32
 }
 
 // Position returns the last successful poll snapshot. Safe to call from
@@ -95,12 +111,24 @@ func New(src EventSource, st Store, reg *rules.Registry, d Dispatcher, interval 
 		dispatch: d,
 		interval: interval,
 		log:      log,
+		sched:    NewScheduler(),
 	}
 }
 
 // WithMetrics attaches Prometheus instrumentation to the poll loop.
 func (p *Poller) WithMetrics(m *metrics.Metrics) *Poller {
 	p.metrics = m
+	return p
+}
+
+// WithReorg enables reorg detection over a window of `window` recent ledgers
+// and holds alerts until they are `depth` ledgers behind the tip. window 0
+// disables detection and depth 0 alerts immediately: both defaults reproduce
+// the behaviour before reorg handling existed. Sources that cannot report
+// ledger hashes are tolerated — detection simply does not run.
+func (p *Poller) WithReorg(window, depth uint32) *Poller {
+	p.reorgWindow = window
+	p.confirmDepth = depth
 	return p
 }
 
@@ -151,6 +179,11 @@ func (p *Poller) Poll(ctx context.Context) error {
 	var contracts []string
 	namesByContract := map[string]map[string]bool{}
 	unfilterable := map[string]bool{}
+	// prioByContract is the highest priority among the monitors watching a
+	// contract: a contract qualifies for the earliest tier it is named in,
+	// so a high-priority monitor is never slowed by sharing a contract with
+	// a low-priority one.
+	prioByContract := map[string]store.Priority{}
 	for _, m := range monitors {
 		ruleList, err := p.store.ListRules(ctx, m.ID, true)
 		if err != nil {
@@ -166,6 +199,9 @@ func (p *Poller) Poll(ctx context.Context) error {
 			}
 			if _, seen := byContract[c]; !seen {
 				contracts = append(contracts, c)
+				prioByContract[c] = m.Priority.Normalized()
+			} else if rank := m.Priority.Rank(); rank > prioByContract[c].Rank() {
+				prioByContract[c] = m.Priority.Normalized()
 			}
 			byContract[c] = append(byContract[c], m)
 			if unfilterable[c] {
@@ -187,15 +223,23 @@ func (p *Poller) Poll(ctx context.Context) error {
 		return nil
 	}
 
-	// Compile the derived filters into the watch list the source sees. A nil
-	// Topics is the safe default: no server-side narrowing.
-	watch := make([]Watch, 0, len(contracts))
+	// Compile the derived filters into the watch list the source sees, ordered
+	// by priority so a high-priority contract is fetched in an earlier request
+	// instead of waiting behind a batch of low-traffic ones. A nil Topics is
+	// the safe default: no server-side narrowing.
+	scheduled := make([]scheduledContract, 0, len(contracts))
+	tierCounts := map[store.Priority]int{}
 	for _, c := range contracts {
-		w := Watch{ContractID: c}
+		sc := scheduledContract{ContractID: c, Priority: prioByContract[c].Normalized()}
 		if !unfilterable[c] {
-			w.Topics = topicFiltersFor(sortedKeys(namesByContract[c]))
+			sc.Topics = topicFiltersFor(sortedKeys(namesByContract[c]))
 		}
-		watch = append(watch, w)
+		scheduled = append(scheduled, sc)
+		tierCounts[sc.Priority]++
+	}
+	watch := p.sched.Order(scheduled)
+	for _, pr := range prioritiesInServiceOrder {
+		p.metrics.SetPriorityContracts(string(pr), tierCounts[pr])
 	}
 
 	state, err := p.store.GetIngestState(ctx)
@@ -215,11 +259,46 @@ func (p *Poller) Poll(ctx context.Context) error {
 		p.log.Info("cold start", "start_ledger", startLedger)
 	}
 
+	// Detect a reorganisation before ingesting, so alerts derived from the
+	// orphaned ledgers are retracted before the replacement chain's events are
+	// evaluated. A detected divergence also rewinds the checkpoint, so the
+	// new chain is re-read even though the old one had advanced past it.
+	if divergence, err := p.detectReorg(ctx); err != nil {
+		p.log.Warn("reorg check failed", "err", err)
+	} else if divergence != 0 && divergence-1 < state.LastLedger {
+		state.LastLedger = divergence - 1
+		state.LastCursor = ""
+		if err := p.store.SetIngestState(ctx, state); err != nil {
+			return err
+		}
+		startLedger = state.LastLedger + 1
+		p.log.Warn("rewinding checkpoint after reorg", "start_ledger", startLedger)
+	}
+
+	// Confirmation depth: hold events until they are `confirmDepth` ledgers
+	// behind the tip. Unconfirmed events are simply not evaluated now; the
+	// capped checkpoint means the same range is re-read once it is confirmed.
+	var confirmedThrough uint32
+	confirmActive := p.confirmDepth > 0
+	if confirmActive {
+		tipNow, err := p.source.LatestLedger(ctx)
+		if err != nil {
+			return err
+		}
+		if tipNow > p.confirmDepth {
+			confirmedThrough = tipNow - p.confirmDepth
+		}
+	}
+
 	// Page the source until it reports no more events for the cycle. The
 	// cursor is opaque; batching (the RPC caps filters per request) is the
 	// source's concern, encoded in its cursors.
 	checkpoint := uint32(0) // min latestLedger across pages
 	tip := uint32(0)        // max latestLedger across pages
+	// tierLedger records the highest ledger at which an event was seen for
+	// each tier, so per-tier lag reflects how stale the newest data that tier
+	// has produced is. A tier with no events falls back to the checkpoint.
+	tierLedger := map[store.Priority]uint32{}
 	cursor := ""
 	for {
 		page, err := p.source.FetchEvents(ctx, startLedger, watch, cursor, stellar.DefaultEventsLimit)
@@ -234,6 +313,12 @@ func (p *Poller) Poll(ctx context.Context) error {
 		}
 		p.scanned += len(page.Events)
 		for _, ev := range page.Events {
+			if confirmActive && ev.Ledger > confirmedThrough {
+				continue // not yet buried deep enough; re-read once it is
+			}
+			if pr, ok := prioByContract[ev.ContractID]; ok && ev.Ledger > tierLedger[pr] {
+				tierLedger[pr] = ev.Ledger
+			}
 			p.handleEvent(ctx, ev, byContract)
 		}
 		if page.NextCursor == "" {
@@ -244,7 +329,20 @@ func (p *Poller) Poll(ctx context.Context) error {
 
 	// Lag: how far the checkpoint we reached trails the node's own tip.
 	// Grows when a batch's page-through takes longer than ledger cadence.
+	if confirmActive && checkpoint > confirmedThrough {
+		checkpoint = confirmedThrough
+	}
 	p.metrics.SetPollLag(int64(tip) - int64(checkpoint))
+	for _, pr := range prioritiesInServiceOrder {
+		if tierCounts[pr] == 0 {
+			continue
+		}
+		observed, ok := tierLedger[pr]
+		if !ok {
+			observed = checkpoint
+		}
+		p.metrics.SetPollLagByPriority(string(pr), int64(tip)-int64(observed))
+	}
 	if checkpoint > state.LastLedger {
 		state.LastLedger = checkpoint
 		state.LastCursor = ""
@@ -331,6 +429,7 @@ func (p *Poller) fireAlert(ctx context.Context, m store.Monitor, rule store.Rule
 		RuleID:         rule.ID,
 		EventID:        eventID,
 		Payload:        payload,
+		Ledger:         ev.Ledger,
 		LedgerClosedAt: ev.LedgerClosedAt,
 		Cooldown:       ruleCooldown(rule),
 	}

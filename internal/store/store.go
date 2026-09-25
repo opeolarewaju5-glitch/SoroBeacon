@@ -14,6 +14,60 @@ import (
 // ErrNotFound is returned when a requested row does not exist.
 var ErrNotFound = errors.New("not found")
 
+// Priority ranks a monitor's contracts in the poller's schedule. It is a
+// small closed set rather than a free integer so the scheduler, the API
+// validation and the database CHECK constraint all agree on the vocabulary.
+type Priority string
+
+const (
+	// PriorityLow is the last tier served in a poll cycle: high-volume,
+	// best-effort monitors whose latency budget is measured in minutes.
+	PriorityLow Priority = "low"
+	// PriorityNormal is the default, so every monitor that existed before
+	// priorities did keeps exactly today's behaviour.
+	PriorityNormal Priority = "normal"
+	// PriorityHigh is served first within a cycle: contracts where a
+	// five-minute alert delay has real cost.
+	PriorityHigh Priority = "high"
+)
+
+// ParsePriority validates a priority string. The empty string maps to
+// PriorityNormal so a caller that never sets one gets today's behaviour,
+// and any other unknown value is rejected rather than silently downgraded.
+func ParsePriority(s string) (Priority, bool) {
+	switch Priority(s) {
+	case "":
+		return PriorityNormal, true
+	case PriorityLow, PriorityNormal, PriorityHigh:
+		return Priority(s), true
+	default:
+		return "", false
+	}
+}
+
+// Normalized returns p with the empty value mapped to PriorityNormal, so a
+// write path that never sets one stores the middle tier rather than an empty
+// string the database CHECK constraint would reject.
+func (p Priority) Normalized() Priority {
+	if p == "" {
+		return PriorityNormal
+	}
+	return p
+}
+
+// Rank orders the tiers for scheduling: higher ranks are served sooner. The
+// zero value of an unset Priority is normal, matching ParsePriority.
+func (p Priority) Rank() int {
+	switch p {
+	case PriorityHigh:
+		return 2
+	case PriorityLow:
+		return 0
+	default:
+		return 1
+	}
+}
+
 // Monitor watches one or more Soroban contracts.
 type Monitor struct {
 	ID          int64     `json:"id"`
@@ -21,6 +75,10 @@ type Monitor struct {
 	ContractIDs []string  `json:"contract_ids"`
 	Enabled     bool      `json:"enabled"`
 	CreatedAt   time.Time `json:"created_at"`
+	// Priority is how soon this monitor's contracts are polled within a
+	// cycle. Empty means PriorityNormal, so JSON written before the field
+	// existed (and rows migrated from it) stays in the middle tier.
+	Priority Priority `json:"priority"`
 	// LastMatchedAt is the ledger close time of the most recent event that
 	// created an alert for this monitor. Nil means it has never matched —
 	// do not backfill a fake timestamp.
@@ -138,6 +196,15 @@ type Alert struct {
 	// alert row. Zero skips the stamp so callers that only persist an
 	// alert (tests, retries) do not invent a wall-clock match time.
 	LedgerClosedAt time.Time `json:"-"`
+	// Ledger is the sequence of the ledger the matching event came from. It
+	// is stored so retention and reorg handling can address alerts by ledger
+	// without parsing the payload. Zero for alerts persisted without one.
+	Ledger uint32 `json:"ledger,omitempty"`
+	// RetractedAt is set when the ledger this alert came from was orphaned by
+	// a chain reorganisation. A retracted alert is kept (the notification
+	// cannot be unsent) but reported as no longer reflecting canonical chain
+	// history. Nil means the alert is still believed to be on the chain.
+	RetractedAt *time.Time `json:"retracted_at,omitempty"`
 	// Cooldown, when > 0, makes CreateAlert suppress this alert if the rule
 	// already fired within the window. It is rule config, not alert data, so
 	// it is never persisted on the alert row.
@@ -193,6 +260,35 @@ type IngestState struct {
 	LastLedger uint32    `json:"last_ledger"`
 	LastCursor string    `json:"last_cursor"`
 	UpdatedAt  time.Time `json:"updated_at"`
+}
+
+// LedgerHash is one recently ingested ledger's identity. The poller records
+// these as it advances and re-reads them each cycle; a ledger whose hash
+// changes is the signature of a chain reorganisation.
+type LedgerHash struct {
+	Ledger uint32 `json:"ledger"`
+	Hash   string `json:"hash"`
+}
+
+// Ledgers persists the recent ledger-hash window used for reorg detection,
+// and records the alerts a reorg orphaned. It is a separate interface so a
+// backend without the feature (or a test fake) can omit it without
+// pretending to implement it.
+type Ledgers interface {
+	// RecordLedgerHashes upserts the observed hashes. Re-observing the same
+	// ledger with the same hash is a no-op; re-observing it with a different
+	// hash is the reorg signature and is recorded as the new value.
+	RecordLedgerHashes(ctx context.Context, hashes []LedgerHash) error
+	// LedgerHashes returns the stored hashes for ledgers in [from, to],
+	// ascending. Ledgers outside the window are omitted.
+	LedgerHashes(ctx context.Context, from, to uint32) ([]LedgerHash, error)
+	// PruneLedgerHashes drops hashes for ledgers strictly before `before`,
+	// bounding how far back a reorg can be detected.
+	PruneLedgerHashes(ctx context.Context, before uint32) error
+	// RetractAlertsFromLedger marks every alert that came from a ledger at or
+	// after `ledger` as retracted (unless already retracted), returning how
+	// many rows changed. One statement keeps the correction atomic.
+	RetractAlertsFromLedger(ctx context.Context, ledger uint32, at time.Time) (int64, error)
 }
 
 // AlertFilter narrows ListAlerts. Zero values mean "no constraint".
@@ -370,6 +466,11 @@ type Alerts interface {
 	// DeleteExpiredAlerts removes up to limit alerts with created_at
 	// before cutoff. delivery_attempts follow via ON DELETE CASCADE.
 	DeleteExpiredAlerts(ctx context.Context, cutoff time.Time, limit int) (deleted int64, err error)
+	// ExpiredAlerts returns up to limit alerts with created_at before cutoff,
+	// oldest first. Retention uses it to read a batch an archiver can persist
+	// before DeleteExpiredAlerts removes it, so a failed archive can block the
+	// delete. Ordering matches DeleteExpiredAlerts exactly.
+	ExpiredAlerts(ctx context.Context, cutoff time.Time, limit int) ([]Alert, error)
 }
 
 // Ingest persists the poller checkpoint.
@@ -460,6 +561,7 @@ type Store interface {
 	Channels
 	Alerts
 	Ingest
+	Ledgers
 	SavedSearches
 	MonitorTemplates
 	GetStats(ctx context.Context) (Stats, error)
